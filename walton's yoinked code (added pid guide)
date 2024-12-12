@@ -1,0 +1,168 @@
+// File: SwerveModule.java
+package frc.robot.subsystems;
+
+import edu.wpi.first.math.controller.PIDController;
+import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.math.kinematics.SwerveModuleState;
+import com.ctre.phoenix.motorcontrol.can.WPI_TalonFX;
+import com.ctre.phoenix.sensors.CANCoder;
+
+public class SwerveModule {
+    private final WPI_TalonFX driveMotor;
+    private final WPI_TalonFX turningMotor;
+    private final CANCoder turningEncoder;
+
+    private final PIDController turningPIDController;
+
+    public SwerveModule(int driveMotorId, int turningMotorId, int turningEncoderId) {
+        driveMotor = new WPI_TalonFX(driveMotorId);
+        turningMotor = new WPI_TalonFX(turningMotorId);
+        turningEncoder = new CANCoder(turningEncoderId);
+
+        turningPIDController = new PIDController(0.1, 0, 0); // Adjust gains as needed
+        turningPIDController.enableContinuousInput(-180, 180);
+    }
+
+    public SwerveModuleState getState() {
+        return new SwerveModuleState(
+            driveMotor.getSelectedSensorVelocity(),
+            Rotation2d.fromDegrees(turningEncoder.getAbsolutePosition())
+        );
+    }
+
+    public void setDesiredState(SwerveModuleState desiredState) {
+        SwerveModuleState optimizedState = SwerveModuleState.optimize(
+            desiredState, 
+            Rotation2d.fromDegrees(turningEncoder.getAbsolutePosition())
+        );
+
+        driveMotor.set(optimizedState.speedMetersPerSecond / MAX_SPEED); // Normalize to motor power range
+
+        double turnOutput = turningPIDController.calculate(
+            turningEncoder.getAbsolutePosition(), 
+            optimizedState.angle.getDegrees()
+        );
+        turningMotor.set(turnOutput);
+    }
+
+    private static final double MAX_SPEED = 3.0; // Max speed in meters per second
+}
+
+// PID Tuning Guide:
+// 1. Start with low P, I, and D values (e.g., P = 0.1, I = 0, D = 0).
+// 2. Gradually increase P until the module reacts quickly but does not oscillate.
+// 3. Add I if the module is slow to reach the target position.
+// 4. Add D to dampen oscillations if they occur.
+// 5. Test thoroughly at different speeds and positions.
+
+// File: SwerveDriveSubsystem.java
+package frc.robot.subsystems;
+
+import edu.wpi.first.math.geometry.Translation2d;
+import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
+import edu.wpi.first.math.kinematics.SwerveDriveOdometry;
+import edu.wpi.first.wpilibj2.command.SubsystemBase;
+import edu.wpi.first.math.kinematics.SwerveModuleState;
+import edu.wpi.first.math.geometry.Pose2d;
+import edu.wpi.first.math.geometry.Rotation2d;
+
+public class SwerveDriveSubsystem extends SubsystemBase {
+    private final SwerveModule frontLeft;
+    private final SwerveModule frontRight;
+    private final SwerveModule backLeft;
+    private final SwerveModule backRight;
+
+    private final SwerveDriveKinematics kinematics;
+    private final SwerveDriveOdometry odometry;
+
+    public SwerveDriveSubsystem() {
+        frontLeft = new SwerveModule(1, 2, 3);
+        frontRight = new SwerveModule(4, 5, 6);
+        backLeft = new SwerveModule(7, 8, 9);
+        backRight = new SwerveModule(10, 11, 12);
+
+        kinematics = new SwerveDriveKinematics(
+            new Translation2d(0.5, 0.5),  // Front left
+            new Translation2d(0.5, -0.5), // Front right
+            new Translation2d(-0.5, 0.5), // Back left
+            new Translation2d(-0.5, -0.5) // Back right
+        );
+
+        odometry = new SwerveDriveOdometry(
+            kinematics, Rotation2d.fromDegrees(0)
+        );
+    }
+
+    public void drive(double xSpeed, double ySpeed, double rot, boolean fieldRelative) {
+        var swerveModuleStates = kinematics.toSwerveModuleStates(
+            fieldRelative
+                ? ChassisSpeeds.fromFieldRelativeSpeeds(xSpeed, ySpeed, rot, odometry.getPoseMeters().getRotation())
+                : new ChassisSpeeds(xSpeed, ySpeed, rot)
+        );
+
+        SwerveDriveKinematics.desaturateWheelSpeeds(swerveModuleStates, SwerveModule.MAX_SPEED);
+
+        frontLeft.setDesiredState(swerveModuleStates[0]);
+        frontRight.setDesiredState(swerveModuleStates[1]);
+        backLeft.setDesiredState(swerveModuleStates[2]);
+        backRight.setDesiredState(swerveModuleStates[3]);
+    }
+
+    @Override
+    public void periodic() {
+        odometry.update(
+            Rotation2d.fromDegrees(getGyroAngle()),
+            frontLeft.getState(),
+            frontRight.getState(),
+            backLeft.getState(),
+            backRight.getState()
+        );
+    }
+
+    public Pose2d getPose() {
+        return odometry.getPoseMeters();
+    }
+
+    public void resetOdometry(Pose2d pose) {
+        odometry.resetPosition(pose, Rotation2d.fromDegrees(getGyroAngle()));
+    }
+
+    private double getGyroAngle() {
+        // Replace with actual gyro angle reading
+        return 0.0;
+    }
+}
+
+// File: RobotContainer.java
+package frc.robot;
+
+import edu.wpi.first.wpilibj.XboxController;
+import edu.wpi.first.wpilibj2.command.Command;
+import edu.wpi.first.wpilibj2.command.RunCommand;
+import frc.robot.subsystems.SwerveDriveSubsystem;
+
+public class RobotContainer {
+    private final SwerveDriveSubsystem swerveDriveSubsystem = new SwerveDriveSubsystem();
+    private final XboxController controller = new XboxController(0);
+
+    public RobotContainer() {
+        configureButtonBindings();
+
+        swerveDriveSubsystem.setDefaultCommand(new RunCommand(() -> {
+            double xSpeed = -controller.getLeftY(); // Forward/backward
+            double ySpeed = controller.getLeftX();  // Strafe
+            double rot = controller.getRightX();    // Rotation
+
+            swerveDriveSubsystem.drive(xSpeed, ySpeed, rot, true);
+        }, swerveDriveSubsystem));
+    }
+
+    private void configureButtonBindings() {
+        // Map additional controller buttons if needed
+    }
+
+    public Command getAutonomousCommand() {
+        // Return the autonomous command
+        return null;
+    }
+}
